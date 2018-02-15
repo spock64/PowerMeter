@@ -1,0 +1,20 @@
+PowerMeter
+
+TODO
+
+* Add WiFi Config
+[* Use different WiFiManager upload ... (Not ArduinoOTA) - done]
+* Add to github
+* Do we really need a hardware button ?
+* Add restart to config html / handler ...
+
+** How does it work? Is it only counting power pulses?
+** Do we lose pulses when we report in the power?
+** Is it better for the server to work out the power - and just report what we see each minute (or whatever)?
+** Or better to report what we have actually see in that minute ...
+** Which seems better than an instantaneous or "sampled" view ...
+** We just need to be clear how much time we have measured for!
+** Watch out for delays conneting to wifi etc.
+
+
+** HOW LONG DOES IT TAKE MILLIS TO OVERRUN ?
