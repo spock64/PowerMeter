@@ -18,3 +18,5 @@ TODO
 
 
 ** HOW LONG DOES IT TAKE MILLIS TO OVERRUN ?
+
+*** Define params ...

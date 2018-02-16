@@ -9,6 +9,8 @@
  Based on the amazing work of Karl Hagström at http://gizmosnack.blogspot.co.uk/2014/10/power-plug-energy-meter-hack.html
 
 */
+#include <Arduino.h>
+#include <FS.h>
 #include <ESP8266WiFi.h>
 extern "C" {
   #include "user_interface.h" // for wifi_station_connect
@@ -17,16 +19,18 @@ extern "C" {
 //these for WifiManager
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
 #include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager
           // ??? WifiManager bug needs to be unreleased MASTER due to https://github.com/tzapu/WiFiManager/issues/81
 
 // these for OTA upport
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
-//#include <ArduinoOTA.h>  // OTA currentlr requires Arduino IDE 1.6.7
-                         // OTA needs ESP module with large enough flash. Basic ESP-01/ESP-12 not big enough, ESP-12E works
+#include <ESP8266HTTPUpdateServer.h>
 
- #include <ESP8266HTTPUpdateServer.h>
+#include <ArduinoJson.h>
+#include <Ticker.h>                                           // For LED status
+
 
 
 #define CONFIG_BUTTON 12
@@ -34,7 +38,7 @@ extern "C" {
 const int CLKPin = D2;//4; // Pin connected to CLK (D2 & INT0)
 const int MISOPin = D1;//5;  // Pin connected to MISO (D5)
 
-const int SEND_INTERVAL = 1 * 60 * 1000; // 1 minutes
+const int SEND_INTERVAL = 1 * 60 * 1000; // 1 minute
 
 //All variables that are changed in the interrupt function must be volatile to make sure changes are saved.
 volatile int Ba = 0;   //Store MISO-byte 1
@@ -72,6 +76,232 @@ int op_mode;
 
 #define CONFIG_MAX_TIME 30000 // 30 secs ...
 long t;   // used to remember when we entered config mode ...
+
+bool shouldSaveConfig = false;
+
+const char *wifi_config_name = "RemoteIR"; // Should be Name and number ...
+int port = 80;
+char passcode[20] = "";
+char host_name[20] = "";
+char port_str[6] = "80";
+char user_id[60] = "";
+
+// Change each time the format changes ...
+const char * CONFIG_FILE_VERSION = "0.1";
+
+// Could this be a local in the function?
+DynamicJsonBuffer jsonBuffer;
+JsonObject& deviceState = jsonBuffer.createObject();
+
+ESP8266WebServer *server = NULL;
+HTTPClient http;
+Ticker ticker;
+
+const int configpin = D2;//10;          // GPIO10 can't be used on NodeMCU !
+const int ledpin = D4;//BUILTIN_LED;    // Built in LED defined for WEMOS people
+
+//+=============================================================================
+// Toggle LED state
+//
+void tick()
+{
+  int state = digitalRead(ledpin);  // get the current state of BUILTIN_LED pin
+  digitalWrite(ledpin, !state);     // set pin to the opposite state
+}
+
+//+=============================================================================
+// Callback notifying us of the need to save config
+//
+void saveConfigCallback () {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
+
+//+=============================================================================
+// Gets called when WiFiManager enters configuration mode
+//
+void configModeCallback (WiFiManager *myWiFiManager) {
+  Serial.println("Entered config mode");
+  Serial.println(WiFi.softAPIP());
+  //if you used auto generated SSID, print it
+  Serial.println(myWiFiManager->getConfigPortalSSID());
+  //entered config mode, make led toggle faster
+  ticker.attach(0.2, tick);
+}
+
+//+=============================================================================
+// Gets called when device loses connection to the accesspoint
+//
+void lostWifiCallback (const WiFiEventStationModeDisconnected& evt) {
+  Serial.println("Lost Wifi");
+  // reset and try again, or maybe put it to deep sleep
+
+  // PJR - should be better way than this?
+  ESP.reset();
+  delay(1000);
+}
+
+//+=============================================================================
+// First setup of the Wifi.
+// If return true, the Wifi is well connected.
+// Should not return false if Wifi cannot be connected, it will loop    PJR - wtf?
+//
+bool setupWifi(bool resetConf) {
+  // start ticker with 0.5 because we start in AP mode and try to connect
+  ticker.attach(0.5, tick);
+
+  // WiFiManager
+  // Local intialization. Once its business is done, there is no need to keep it around
+  WiFiManager wifiManager;
+  // reset settings - for testing
+  if (resetConf)
+    wifiManager.resetSettings();
+
+  // set callback that gets called when connecting to previous WiFi fails, and enters Access Point mode
+  wifiManager.setAPCallback(configModeCallback);
+  // set config save notify callback
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+  // Reset device if on config portal for greater than 3 minutes
+  wifiManager.setConfigPortalTimeout(180);
+
+  if (SPIFFS.begin()) {
+    Serial.println("mounted file system");
+    if (SPIFFS.exists("/config.json")) {
+      //file exists, reading and loading
+      Serial.println("reading config file");
+      File configFile = SPIFFS.open("/config.json", "r");
+      if (configFile) {
+        Serial.println("opened config file");
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+
+        // Locals ...
+        DynamicJsonBuffer jsonBuffer;
+        JsonObject& json = jsonBuffer.parseObject(buf.get());
+
+        if (json.success())
+        {
+          Serial.print("json parse complete - ");
+          json.printTo(Serial);
+          Serial.println(" ...");
+
+          // Check for version keys
+          if (json.containsKey("version"))
+          {
+            if(strcmp(json["version"], CONFIG_FILE_VERSION) == 0)
+            {
+              // File is OK
+              Serial.println("\nConfig file version matches - loading");
+
+              if (json.containsKey("hostname")) strncpy(host_name, json["hostname"], 20);
+              if (json.containsKey("passcode")) strncpy(passcode, json["passcode"], 20);
+              if (json.containsKey("user_id")) strncpy(user_id, json["user_id"], 60);
+              if (json.containsKey("port_str")) {
+                strncpy(port_str, json["port_str"], 6);
+                port = atoi(json["port_str"]);
+              }
+            }
+            else
+            {
+              Serial.println("\nConfig file is wrong version\n");
+              // *** PJR - so ?
+              //Serial.println(json["version"]);
+            }
+          }
+          else
+          {
+            // No version key ...
+            Serial.println("No version key found ...");
+            // *** PJR - so ?
+          }
+
+        }
+        else
+        {
+          Serial.println("failed to load json config");
+          // *** PJR - so ?
+        }
+      }
+    }
+  } else {
+    // Should do something with the LED?
+    Serial.println("failed to mount FS");
+  }
+
+  WiFiManagerParameter custom_hostname("hostname", "Choose a hostname to this IR Controller", host_name, 20);
+  wifiManager.addParameter(&custom_hostname);
+  WiFiManagerParameter custom_passcode("passcode", "Choose a passcode", passcode, 20);
+  wifiManager.addParameter(&custom_passcode);
+  WiFiManagerParameter custom_port("port_str", "Choose a port", port_str, 6);
+  wifiManager.addParameter(&custom_port);
+
+  // fetches ssid and pass and tries to connect
+  // if it does not connect it starts an access point with the specified name
+  // and goes into a blocking loop awaiting configuration
+  if (!wifiManager.autoConnect(wifi_config_name)) {
+    Serial.println("Failed to connect and hit timeout");
+    // reset and try again, or maybe put it to deep sleep
+    ESP.reset();
+    delay(1000);
+  }
+
+  // if you get here you have connected to the WiFi
+  strncpy(host_name, custom_hostname.getValue(), 20);
+  strncpy(passcode, custom_passcode.getValue(), 20);
+  strncpy(port_str, custom_port.getValue(), 6);
+  strncpy(user_id,"**PJR NO UID***",60);                      // PJR Remove when HTML sorted ...
+  port = atoi(port_str);
+
+// ???
+  if (server != NULL) {
+    delete server;
+  }
+  server = new ESP8266WebServer(port);
+
+  // Reset device if lost wifi Connection
+  WiFi.onStationModeDisconnected(&lostWifiCallback);
+
+  Serial.println("WiFi connected! User chose hostname '" + String(host_name) + String("' passcode '") + String(passcode) + "' and port '" + String(port_str) + "'");
+
+  // save the custom parameters to FS
+  if (shouldSaveConfig) {
+    Serial.println(" config...");
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& json = jsonBuffer.createObject();
+    json["hostname"] = host_name;
+    json["passcode"] = passcode;
+    json["port_str"] = port_str;
+    json["user_id"] = user_id;
+    json["ip"] = WiFi.localIP().toString();
+    json["gw"] = WiFi.gatewayIP().toString();
+    json["sn"] = WiFi.subnetMask().toString();
+    json["version"] = CONFIG_FILE_VERSION;
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+      Serial.println("failed to open config file for writing");
+    }
+
+    json.printTo(Serial);
+    Serial.println("");
+    Serial.println("Writing config file");
+    json.printTo(configFile);
+    configFile.close();
+    jsonBuffer.clear();
+    Serial.println("Config written successfully");
+  }
+  ticker.detach();
+
+  // keep LED on
+  digitalWrite(ledpin, LOW);
+  return true;
+}
+
+
 
 void doOTA() {
 
@@ -349,11 +579,15 @@ boolean sendReading() {
   return sentOk;
 }
 
-void setup() {
-   Serial.begin(115200); Serial.println();
+void setup()
+{
+  // Initialize serial
+  Serial.begin(115200); Serial.println();
 
-   // Should read config out of filestore ?
-   // Then load AP mode if there's no parameters found ?
+  Serial.println("ESP8266 PowerMeter with OTA updates");
+
+  // set led pin as output
+  pinMode(ledpin, OUTPUT);
 
    pinMode(CONFIG_BUTTON, INPUT_PULLUP);
    if (digitalRead(CONFIG_BUTTON) == LOW) {
@@ -389,13 +623,13 @@ void loop()
 {
   if(op_mode == RUN)
   {
+    // Should look for the button and enter config mode if it's held down
+
     if ((millis() - lastSend) > SEND_INTERVAL) {
       if (sendReading()) {
          clearTallys();
       }
       lastSend = millis();
-
-      // could monitor the button ... and enter config mode ?
     }
 
     if ((millis() - debugOps) > 10000) { // debug output every 10 secs to see its running
